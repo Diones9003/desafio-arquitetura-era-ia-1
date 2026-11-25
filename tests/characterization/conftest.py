@@ -32,7 +32,26 @@ def provider_normal():
 
 @pytest.fixture(scope="session")
 def client():
-    # timeout generoso: na v1 a sugestão (F2) é síncrona e leva ~16 s; o relatório
-    # de 1 dia, ~10 s. Ainda abaixo dos 30 s da borda.
+    # timeout generoso: a sugestão (F2) em streaming leva ~16 s até o fim; o relatório
+    # de 1 dia (F3) roda assíncrono e é consultado por polling. Ainda abaixo da borda.
     with httpx.Client(base_url=BASE_URL, timeout=60.0) as c:
         yield c
+
+
+@pytest.fixture
+def provider_url():
+    """URL do provider simulado, para os testes que exercitam o /admin (falhas)."""
+    return PROVIDER_URL
+
+
+@pytest.fixture
+def reset_provider():
+    """Reseta o provider para modo normal antes e depois de um teste de falha."""
+    def _reset():
+        try:
+            httpx.post(f"{PROVIDER_URL}/admin/reset", timeout=10)
+        except httpx.HTTPError:
+            pass
+    _reset()
+    yield
+    _reset()

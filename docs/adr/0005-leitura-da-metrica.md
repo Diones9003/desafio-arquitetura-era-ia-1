@@ -28,8 +28,13 @@ Opção 2. Exceções declaradas (concretos, estáveis por natureza, não são d
 - **`schemas`** (D=1,00): são os tipos de valor do domínio (pydantic). São estáveis — mudam
   só quando o contrato do helpdesk muda — e é correto que muitos dependam deles. Criar uma
   abstração sobre tipos de dados seria desenho pela fórmula, não melhoria.
-- **`config`** (D=1,00): só nomes de capacidade e endereço do gateway (duas variáveis de
-  ambiente). É configuração, concreta e estável; na v2 seu Ca caiu de 6 para 2.
+- **`config`** (D=1,00): só nomes de capacidade, endereço do gateway e tetos de tempo.
+  É configuração, concreta e estável; na v2 seu Ca caiu de 6 para 2.
+- **`jobs`** (D=1,00, novo na `main`): o armazém em memória das tarefas assíncronas da F3
+  (estado, progresso, resultado). É uma estrutura de dados concreta, estável, de que só o
+  ponto de composição (`main`) depende (Ca=1, Ce=0). O enunciado coloca persistência de
+  tarefas fora de escopo, então abstrair isto agora seria desenho pela fórmula; trocá-lo
+  por Redis/banco no futuro é mudança só deste componente.
 
 **Não são exceção** (e não estão na zona de dor): `adapters.gateway` (o componente que
 chama o gateway, D=0,50) e as features `classification`, `suggestion`, `extraction`,

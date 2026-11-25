@@ -21,5 +21,15 @@ EXTRACT = "extract"
 
 MAX_OUTPUT_TOKENS = 2000
 
+# Timeout explícito das features SÍNCRONAS (F1 classify, F4 extract), em segundos.
+# É o teto do lado da aplicação: mesmo que o gateway demore, a chamada não fica
+# pendurada além disso. Combinado com o timeout por modelo no gateway (que corta o
+# primário travado e cai no fallback), garante resposta — sucesso ou erro — em até 15s.
+SYNC_TIMEOUT = 15.0
+
+# Sugestão de intervalo (segundos) que o cliente deve esperar antes de consultar o
+# status de um relatório assíncrono (header Retry-After na resposta 202 da F3).
+REPORT_RETRY_AFTER = 5
+
 TICKETS_FILE = os.environ.get("TICKETS_FILE", "/data/tickets.jsonl")
 TICKETS_PER_CALL = 150

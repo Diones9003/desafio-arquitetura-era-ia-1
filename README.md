@@ -3,10 +3,12 @@
 Fork do desafio "Arquitetura na Era da IA". A entrega está na branch `main`; as tags
 `v1-coupled` e `v2-decoupled` marcam os estados reais da evolução.
 
-> **Esta é a `v2-decoupled`.** A aplicação já chama os modelos exclusivamente pelo gateway,
-> por capacidades lógicas, sem chaves de provider — mas o **comportamento externo é o mesmo
-> da v1** (as quatro features ainda respondem de forma síncrona). A decisão do modo de
-> execução de cada feature (streaming/assíncrono) acontece na `main`.
+> **Esta é a versão final (`main`).** A aplicação chama os modelos exclusivamente pelo
+> gateway, por capacidades lógicas e sem chaves de provider, e cada feature entrega no modo
+> decidido pela árvore de decisão (ADR 0007): **F1 e F4 síncronas, F2 em streaming (SSE),
+> F3 assíncrona (202 + status)**. As tags `v1-coupled` (aplicação recebida + caracterização)
+> e `v2-decoupled` (refatorada atrás do gateway, mesmo comportamento) marcam os estados
+> anteriores — a suíte de caracterização é idêntica entre as duas tags.
 
 ## Visão geral
 
@@ -117,9 +119,10 @@ python metrics/measure.py app/helpdesk/ v2-decoupled
 
 ## Métrica
 
-Régua do requisito 3 (Ca, Ce, I, A, D e a Main Sequence). CSVs e gráficos em
-`metrics/results/`. O componente que chama o gateway é **`adapters.gateway`** (único ponto
-que fala com o gateway; nenhuma feature o importa — só `main.py`, o ponto de composição).
+Régua do requisito 3 (Ca, Ce, I, A, D e a Main Sequence). CSVs e gráficos das **três
+versões** (`v1-coupled`, `v2-decoupled`, `main`) em `metrics/results/`. O componente que
+chama o gateway é **`adapters.gateway`** (único ponto que fala com o gateway; nenhuma
+feature o importa — só `main.py`, o ponto de composição).
 
 **O que saiu de onde, da v1 para a v2:**
 
@@ -134,8 +137,15 @@ que fala com o gateway; nenhuma feature o importa — só `main.py`, o ponto de 
 - **`schemas`** (D=1,00): tipos de valor do domínio, estáveis por natureza — exceção
   declarada no ADR 0005.
 
-Exceções declaradas (concretos e estáveis, não são dor real): **`schemas`** e **`config`**.
-Não são exceção e não estão na zona de dor: `adapters.gateway` e as quatro features.
+**O que muda da v2 para a `main`:** o desenho de acoplamento é o mesmo (a decisão de modo
+de execução não reintroduz dependências); surge só **`jobs`** (armazém em memória das
+tarefas assíncronas da F3), um módulo-folha concreto (Ca=1, Ce=0, D=1,00) do qual só o
+`main` depende. `adapters.gateway` segue em D=0,50 e as features entre D=0,25 e 0,33 —
+nenhuma na zona de dor.
+
+Exceções declaradas (concretos e estáveis, não são dor real): **`schemas`**, **`config`**
+e **`jobs`** (ver ADR 0005). Não são exceção e não estão na zona de dor: `adapters.gateway`
+(o componente que chama o gateway) e as quatro features.
 
 ## Tabela de capacidades
 
@@ -156,23 +166,82 @@ Comportamento de cada feature quando **não há nenhum modelo `large` disponíve
 
 | Feature | Sem `large` | Resposta / status |
 |---|---|---|
-| F1 classificação | cai no `mini` | `200` com a classificação do `gpt-fake-mini` |
-| F2 sugestão | falha explícita | erro do gateway → a feature não entrega sugestão (sem `large`, não responde) |
-| F3 relatório | falha explícita | tarefa chega a estado de falha visível, com motivo |
-| F4 extração | falha explícita | erro explícito; **nunca** um dado parcial para a automação |
+| F1 classificação | cai no `mini` | `200` com a classificação do `gpt-fake-mini` (observado ~0,4 s) |
+| F2 sugestão | falha explícita | stream abre (`200`), mas emite imediatamente `event: error`; **nenhuma** sugestão é entregue |
+| F3 relatório | falha explícita | o status da tarefa chega a `{"state":"failed","reason":...}` (visível, com motivo) |
+| F4 extração | falha explícita | `500` explícito; **nunca** um dado parcial para a automação |
 
 ## Fluxos
 
-> Nesta tag (`v2-decoupled`) as quatro features são **síncronas**, como na v1 — a refatoração
-> não mudou o comportamento externo. Os modos de execução decididos (streaming para F2,
-> assíncrono para F3) entram na `main`, com o ADR de execução e os testes atualizados.
+Modo de execução de cada feature (decidido pela árvore de decisão no **ADR 0007**) e como
+consumir o resultado. Tempos medidos pela borda (`localhost:8000`) com o provider em modo
+normal.
 
-| Feature | Modo (v2) | Como consumir |
+| Feature | Modo | Garantia medida |
 |---|---|---|
-| F1 classificação | síncrono | `curl -s -X POST localhost:8000/tickets/classification -H 'Content-Type: application/json' -d '{"ticket_id":"TK-1","text":"Fui cobrado duas vezes"}'` |
-| F2 sugestão | síncrono | `curl -s -X POST localhost:8000/tickets/reply-suggestion -H 'Content-Type: application/json' -d '{"ticket_id":"TK-1","text":"Meu pedido não chegou"}'` |
-| F3 relatório | síncrono (1 período curto) | `curl -s -X POST localhost:8000/reports/topics -H 'Content-Type: application/json' -d '{"start":"2026-08-01","end":"2026-08-01"}'` |
-| F4 extração | síncrono | `curl -s -X POST localhost:8000/tickets/extraction -H 'Content-Type: application/json' -d '{"ticket_id":"TK-1","text":"Trocar o pedido #605065"}'` |
+| F1 classificação | **síncrono** | resultado completo em ~1,2 s (≤3 s); com primário em `timeout`, responde via fallback em ~9 s (≤15 s) |
+| F2 sugestão | **streaming** (SSE) | primeiro trecho em ~0,96 s (≤1,5 s), texto fluindo até o fim |
+| F3 relatório | **assíncrono** (202 + status) | `202` em ~2 ms (≤1 s); relatório dos 5.000 tickets disponível depois |
+| F4 extração | **síncrono** | resultado completo em ~1,2 s; com primário em `timeout`, fallback em ~9 s (≤15 s) |
+
+**F1 — síncrono.** Resposta inteira no corpo:
+
+```bash
+curl -s -X POST localhost:8000/tickets/classification \
+  -H 'Content-Type: application/json' \
+  -d '{"ticket_id":"TK-1","text":"Fui cobrado duas vezes"}'
+# {"ticket_id":"TK-1","category":"payment","priority":"medium"}
+```
+
+**F2 — streaming (Server-Sent Events).** Use `curl -N` para não bufferizar; o texto chega em
+eventos `data:` e termina em `event: end`:
+
+```bash
+curl -N -X POST localhost:8000/tickets/reply-suggestion \
+  -H 'Content-Type: application/json' \
+  -d '{"ticket_id":"TK-1","text":"Meu pedido não chegou"}'
+# data: {"chunk": "Olá! Sinto muito"}
+# data: {"chunk": " pelo transtorno..."}
+# ...
+# event: end
+# data: {"ticket_id": "TK-1"}
+```
+
+Falha no meio do stream (o `200` já foi enviado) chega como `event: error` — reproduza com o
+primário do `suggest` em `midstream_error`.
+
+**F3 — assíncrono (Asynchronous Request-Reply).** O `POST` responde `202` com `Location`
+(URL de status) e `Retry-After`; consulte o status até receber `303` para o resultado:
+
+```bash
+# 1) pede o relatório do mês inteiro -> 202 na hora
+curl -si -X POST localhost:8000/reports/topics \
+  -H 'Content-Type: application/json' \
+  -d '{"start":"2026-08-01","end":"2026-08-31"}'
+# HTTP/1.1 202 Accepted
+# location: /reports/topics/status/7f3a
+# retry-after: 5
+
+# 2) acompanha o andamento (200 enquanto corre)
+curl -s localhost:8000/reports/topics/status/7f3a
+# {"state":"running","progress":"1800/5000"}
+
+# 3) quando pronto, o status responde 303 -> siga o Location
+curl -sL localhost:8000/reports/topics/status/7f3a
+# {"start":"2026-08-01","end":"2026-08-31","total_tickets":5000,"topics":[...]}
+```
+
+Se os dois providers estiverem em `error_500`, o status chega a `{"state":"failed","reason":...}`
+em poucos segundos (≤60 s) e nunca fica preso em `running`.
+
+**F4 — síncrono.** Igual à F1:
+
+```bash
+curl -s -X POST localhost:8000/tickets/extraction \
+  -H 'Content-Type: application/json' \
+  -d '{"ticket_id":"TK-1","text":"Trocar o pedido #605065"}'
+# {"ticket_id":"TK-1","order_number":"#605065","product":null}
+```
 
 ## Troca de modelo
 
@@ -215,6 +284,7 @@ configurado e documentado na chave `helpdesk-app` (ver `gateway/setup-keys.py`).
 | [0004](docs/adr/0004-governanca-chaves-orcamentos-limites.md) | corporativa | Governança: chaves, orçamento e limite de requisições |
 | [0005](docs/adr/0005-leitura-da-metrica.md) | software | Leitura da métrica e exceções declaradas |
 | [0006](docs/adr/0006-servicos-extras-compose.md) | software | Serviços extras no compose: banco do gateway e provisionamento de chaves |
+| [0007](docs/adr/0007-modo-de-execucao-por-feature.md) | solução | Modo de execução por feature: F1/F4 síncronos, F2 streaming, F3 assíncrono |
 
 Plano de refatoração (alvos, piloto, revisão e handoff para o agente):
 [`docs/refactoring-plan.md`](docs/refactoring-plan.md).

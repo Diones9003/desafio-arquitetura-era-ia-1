@@ -1,16 +1,25 @@
-# Gateway de IA (LiteLLM Proxy) — Fase 2
+# Gateway de IA (LiteLLM Proxy) — versão final (main)
 #
 # A aplicação conhece só CAPACIDADES LÓGICAS (classify, suggest, topics, extract).
 # Aqui cada capacidade é mapeada para um modelo físico primário e seus fallbacks
 # técnicos. Trocar o modelo por trás de uma capacidade é mudança deste arquivo,
-# não do código da aplicação.
+# não do código da aplicação (reinicia-se só o serviço `gateway`).
 #
 # Escolha do primário espelha a v1: F1 (classify) e F4 (extract) na OpenAI;
 # F2 (suggest) e F3 (topics) na Anthropic. O fallback técnico é sempre o large do
 # OUTRO provider (os larges dos dois são equivalentes). Só F1 aceita um modelo
 # fraco (mini) como último recurso — classificação tolera imprecisão menor;
 # F2/F3/F4 falham explicitamente sem um modelo large (texto, análise e dado
-# extraído errados causam dano, então: zero tolerância).
+# extraído errados causam dano, então: zero tolerância). Ver ADR 0003.
+#
+# TIMEOUTS POR MODO (ADR 0007): os tetos por modelo são pensados para o modo de
+# execução de cada feature e para os limites de experiência da main:
+#   - classify/extract (SÍNCRONOS): timeout curto (8s). Com o primário travado,
+#     o gateway não retenta timeout (retry_policy abaixo) e cai no fallback large
+#     do outro provider; 8s + ~2s do fallback cabem no teto de 15s do síncrono.
+#   - suggest (STREAMING): timeout 10s cobre a abertura do stream / primeiro token.
+#   - topics (ASSÍNCRONO): timeout 60s, folgado — roda em segundo plano, ninguém
+#     espera na conexão, e cada lote de 150 tickets pode gerar um JSON grande.
 
 model_list:
   # ----------------------------------------------------------------- classify
@@ -19,22 +28,19 @@ model_list:
       model: openai/gpt-fake-large
       api_base: http://provider-fake:8090/openai/v1
       api_key: os.environ/FAKE_OPENAI_KEY
-      timeout: 25
-      num_retries: 1
+      timeout: 8
   - model_name: classify-fallback   # fallback técnico: claude large (anthropic)
     litellm_params:
       model: anthropic/claude-fake-large
       api_base: http://provider-fake:8090/anthropic
       api_key: os.environ/FAKE_ANTHROPIC_KEY
-      timeout: 25
-      num_retries: 1
+      timeout: 8
   - model_name: classify-weak       # último recurso só da F1: gpt mini (openai)
     litellm_params:
       model: openai/gpt-fake-mini
       api_base: http://provider-fake:8090/openai/v1
       api_key: os.environ/FAKE_OPENAI_KEY
-      timeout: 25
-      num_retries: 1
+      timeout: 8
 
   # ------------------------------------------------------------------ suggest
   - model_name: suggest             # primário: claude large (anthropic)
@@ -42,15 +48,13 @@ model_list:
       model: anthropic/claude-fake-large
       api_base: http://provider-fake:8090/anthropic
       api_key: os.environ/FAKE_ANTHROPIC_KEY
-      timeout: 25
-      num_retries: 1
+      timeout: 10
   - model_name: suggest-fallback    # fallback técnico: gpt large (openai)
     litellm_params:
       model: openai/gpt-fake-large
       api_base: http://provider-fake:8090/openai/v1
       api_key: os.environ/FAKE_OPENAI_KEY
-      timeout: 25
-      num_retries: 1
+      timeout: 10
 
   # ------------------------------------------------------------------- topics
   - model_name: topics              # primário: claude large (anthropic)
@@ -58,15 +62,13 @@ model_list:
       model: anthropic/claude-fake-large
       api_base: http://provider-fake:8090/anthropic
       api_key: os.environ/FAKE_ANTHROPIC_KEY
-      timeout: 25
-      num_retries: 1
+      timeout: 60
   - model_name: topics-fallback     # fallback técnico: gpt large (openai)
     litellm_params:
       model: openai/gpt-fake-large
       api_base: http://provider-fake:8090/openai/v1
       api_key: os.environ/FAKE_OPENAI_KEY
-      timeout: 25
-      num_retries: 1
+      timeout: 60
 
   # ------------------------------------------------------------------ extract
   - model_name: extract             # primário: gpt large (openai)
@@ -74,21 +76,19 @@ model_list:
       model: openai/gpt-fake-large
       api_base: http://provider-fake:8090/openai/v1
       api_key: os.environ/FAKE_OPENAI_KEY
-      timeout: 25
-      num_retries: 1
+      timeout: 8
   - model_name: extract-fallback    # fallback técnico: claude large (anthropic)
     litellm_params:
       model: anthropic/claude-fake-large
       api_base: http://provider-fake:8090/anthropic
       api_key: os.environ/FAKE_ANTHROPIC_KEY
-      timeout: 25
-      num_retries: 1
+      timeout: 8
 
 # Fallbacks técnicos automáticos por capacidade (primário -> outro provider).
-# Só F1 escala para o modelo fraco; F2/F3/F4 não têm essa opção, por decisão.
+# Só F1 escala para o modelo fraco; F2/F3/F4 não têm essa opção, por decisão (ADR 0003).
 litellm_settings:
-  num_retries: 1            # 1 retry no mesmo destino antes de cair no fallback
-  request_timeout: 25       # teto global < 30s da borda; cobre a F2 síncrona (~16s)
+  num_retries: 0            # base; o retry_policy abaixo decide por tipo de erro
+  request_timeout: 65       # teto global folgado para a F3 assíncrona (topics, 60s)
   fallbacks:
     - classify: ["classify-fallback", "classify-weak"]
     - suggest: ["suggest-fallback"]
@@ -97,10 +97,19 @@ litellm_settings:
 
 router_settings:
   routing_strategy: simple-shuffle
-  num_retries: 1
-  timeout: 25
+  timeout: 65
   allowed_fails: 2          # abre o cooldown de um destino após 2 falhas seguidas
   cooldown_time: 15         # segundos que um destino fica de fora após estourar
+  # Política de retry POR TIPO DE ERRO. A chave do teto de 15s do síncrono:
+  #  - timeout NÃO é retentado no mesmo destino -> vai direto ao fallback
+  #  - erro 500/429 (transiente) é retentado 1x no primário antes do fallback,
+  #    então o primário é tentado no máximo 2 vezes (ver README / fallback)
+  retry_policy:
+    TimeoutErrorRetries: 0
+    InternalServerErrorRetries: 1
+    RateLimitErrorRetries: 1
+    ContentPolicyViolationErrorRetries: 0
+    BadRequestErrorRetries: 0
 
 # Estado das virtual keys, budgets e limites. Persistido no Postgres (serviço gateway-db).
 general_settings:
