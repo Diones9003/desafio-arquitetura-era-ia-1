@@ -1,9 +1,71 @@
 services:
+  # Provider de IA simulado (NÃO alterar). Imita OpenAI e Anthropic, com latência,
+  # preços e falhas sob comando. É o único que conhece as chaves FAKE_*.
   provider-fake:
     build: ./provider-fake
     env_file: .env
     ports:
       - "8090:8090"
+
+  # Banco do gateway: o LiteLLM guarda aqui as virtual keys, os gastos (budget) e os
+  # contadores de limite de requisições. É o que permite o gateway RECUSAR uma
+  # requisição fora do budget ou do limite. (Postgres é o banco suportado pelo LiteLLM.)
+  gateway-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: litellm
+      POSTGRES_DB: litellm
+    volumes:
+      - gateway-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Gateway de IA (LiteLLM Proxy). Única peça que conhece as chaves de provider e os
+  # modelos físicos. Expõe as capacidades lógicas (classify/suggest/topics/extract)
+  # por uma API compatível com OpenAI, e cuida de roteamento, fallback, timeout,
+  # retries, budget e limite de requisições por virtual key.
+  gateway:
+    # Variante "-database": embute o Prisma e roda as migrações no boot. É o que torna as
+    # virtual keys com budget/limite (ADR 0004/0006) funcionarem sem passo manual.
+    image: ghcr.io/berriai/litellm-database:main-v1.55.8
+    env_file: .env
+    environment:
+      # Banco onde ficam virtual keys, gastos e limites. `DATABASE_URL` é a variável que o
+      # entrypoint da imagem usa para rodar as migrações do Prisma no boot.
+      DATABASE_URL: "postgresql://litellm:litellm@gateway-db:5432/litellm"
+    volumes:
+      - ./gateway/config.yaml:/app/config.yaml:ro
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness')"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    depends_on:
+      provider-fake:
+        condition: service_started
+      gateway-db:
+        condition: service_healthy
+
+  # Serviço efêmero: provisiona as virtual keys (uma com budget, uma com limite de
+  # requisições) assim que o gateway fica saudável, e termina. `service_completed_
+  # successfully` garante que o app só sobe depois que as chaves existem.
+  gateway-setup:
+    image: python:3.12-slim
+    env_file: .env
+    environment:
+      GATEWAY_URL: "http://gateway:4000"
+    volumes:
+      - ./gateway/setup-keys.py:/setup-keys.py:ro
+    command: ["python", "/setup-keys.py"]
+    restart: "no"
+    depends_on:
+      gateway:
+        condition: service_healthy
 
   edge:
     image: nginx:1.27-alpine
@@ -17,7 +79,11 @@ services:
 
   app:
     build: ./app
-    env_file: .env
+    # A aplicação NÃO usa env_file: ela não enxerga chaves de provider. Recebe só o
+    # endereço do gateway e a sua virtual key.
+    environment:
+      GATEWAY_URL: "http://gateway:4000"
+      GATEWAY_API_KEY: "${GATEWAY_API_KEY}"
     volumes:
       - ./data:/data:ro
     healthcheck:
@@ -26,5 +92,8 @@ services:
       timeout: 3s
       retries: 20
     depends_on:
-      provider-fake:
-        condition: service_healthy
+      gateway-setup:
+        condition: service_completed_successfully
+
+volumes:
+  gateway-db-data:
